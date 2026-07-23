@@ -25,7 +25,7 @@ jobs:
           images: ghcr.io/belgaied2/brother-scan-to-paperless
           tags: |
             type=raw,value=main
-            type=date,format=YYYYMMDD
+            type=raw,value={{date 'YYYYMMDD'}}
       - uses: docker/build-push-action@v6
         with:
           context: .
