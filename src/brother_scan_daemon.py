@@ -129,9 +129,21 @@ def do_scan(config: dict) -> bool:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     ext = config["format"]
     outfile = os.path.join(config["consume_dir"], f"scan_{timestamp}.{ext}")
+    # Write to a hidden temporary file and rename it into place only once
+    # scanimage has finished. Paperless ignores dotfiles, so it can never pick
+    # up a partially written image when the consume directory is on a network
+    # filesystem where its size stability check may see stale attributes.
+    tmpfile = os.path.join(
+        config["consume_dir"],
+        f".scan_{timestamp}.{ext}.part",
+    )
     log_file = config.get("log_file")
 
     log(f"Starting scan -> {outfile}", log_file)
+
+    def cleanup_tmp() -> None:
+        if os.path.exists(tmpfile):
+            os.remove(tmpfile)
 
     try:
         cmd = [
@@ -139,7 +151,7 @@ def do_scan(config: dict) -> bool:
             f"--device-name={config['scanner_device']}",
             f"--resolution={config['resolution']}",
             f"--format={config['format']}",
-            f"--output-file={outfile}",
+            f"--output-file={tmpfile}",
         ]
 
         result = subprocess.run(
@@ -151,9 +163,12 @@ def do_scan(config: dict) -> bool:
 
         if (
             result.returncode == 0
-            and os.path.exists(outfile)
-            and os.path.getsize(outfile) > 0
+            and os.path.exists(tmpfile)
+            and os.path.getsize(tmpfile) > 0
         ):
+            # Atomic within the consume filesystem: Paperless either sees the
+            # temporary file (ignored) or the complete final image.
+            os.replace(tmpfile, outfile)
             size = os.path.getsize(outfile)
             log(f"Scan complete: {outfile} ({size:,} bytes)", log_file)
             return True
@@ -162,17 +177,16 @@ def do_scan(config: dict) -> bool:
                 f"Scan failed: exit={result.returncode} stderr={result.stderr.strip()}",
                 log_file,
             )
-            if os.path.exists(outfile):
-                os.remove(outfile)
+            cleanup_tmp()
             return False
 
     except subprocess.TimeoutExpired:
         log(f"Scan timed out after {config['scan_timeout']}s", log_file)
-        if os.path.exists(outfile):
-            os.remove(outfile)
+        cleanup_tmp()
         return False
     except Exception as e:
         log(f"Scan error: {e}", log_file)
+        cleanup_tmp()
         return False
 
 
