@@ -134,23 +134,32 @@ Config lives at `/etc/brother-scan-to-paperless/config.json`:
 | `consume_dir` | Paperless-ngx consume folder path | (required) |
 | `scanner_device` | SANE device name | `brother4:net1;dev0` |
 | `resolution` | Scan resolution in DPI | `300` |
-| `source` | Scan source (`FB` = flatbed, `ADF` = feeder) | `FB` |
+| `source` | Scan source: `FB` = flatbed, `ADF` = feeder. ADF uses batch mode and combines pages. | `FB` |
 | `size` | Paper size | `A4` |
 | `format` | Output format (`tiff`, `png`, `pnm`) | `tiff` |
 | `register_interval` | Seconds between SNMP re-registrations | `300` |
-| `scan_timeout` | Max seconds for a single scan | `120` |
+| `scan_timeout` | Max seconds for a scan job (increase for long ADF stacks) | `120` |
 | `batch_idle_seconds` | Seconds without a new scan before the batch is published | `45` |
 | `batch_max_wait_seconds` | Hard cap on how long a batch is held | `300` |
 | `batch_max_files` | Publish once the batch has this many scans (`0` = no limit) | `10` |
+| `merge_batch` | Merge all scan jobs in a batch into one TIFF | `false` |
+| `dedupe_seconds` | Ignore duplicate printer events within this window | `900` |
 | `display_name` | Name shown on printer LCD | `Paperless` |
 | `log_file` | Log file path | `/var/log/brother-scan-to-paperless.log` |
 
-Scans are written as hidden `.scan_<batch>_<seq>.<ext>.part` files and published
-together as `scan_<batch>_<seq>.<ext>` when the batch window closes, so Paperless
-never sees a partial file and can group a multi-scan batch. `--test` publishes
-immediately.
+On the ADF, `scanimage` runs in batch mode and the page files are combined with
+`tiffcp` into one multi-page TIFF per scan job. With `merge_batch` enabled, all
+jobs in the batch are merged into a single `scan_<batch>.tiff`; with it off,
+each job is published as `scan_<batch>_<seq>.tiff` so fronts and backs can be
+interleaved later. Hidden `.part` files are never visible to Paperless.
+`--test` publishes immediately.
 
 All settings can also be passed as CLI flags (run `brother-scan-to-paperless run --help`).
+
+## Versioning
+
+Releases are tagged `vX.Y.Z`. The build workflow publishes `vX.Y.Z` and `X.Y.Z`
+images; the Helm chart pins `image.tag` to the version.
 
 ## Logs
 

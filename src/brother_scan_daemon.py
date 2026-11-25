@@ -14,6 +14,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -21,7 +22,7 @@ import sys
 import time
 from datetime import datetime
 
-__version__ = "1.0.0"
+__version__ = "0.0.1"
 
 DEFAULT_CONFIG_PATHS = [
     "/etc/brother-scan-to-paperless/config.json",
@@ -43,6 +44,8 @@ DEFAULT_CONFIG = {
     "batch_idle_seconds": 45,
     "batch_max_wait_seconds": 300,
     "batch_max_files": 10,
+    "dedupe_seconds": 900,
+    "merge_batch": False,
     "display_name": "Paperless",
     "log_file": "/var/log/brother-scan-to-paperless.log",
 }
@@ -128,6 +131,13 @@ def register_profiles(
         return False
 
 
+SOURCE_ALIASES = {
+    "FB": "FlatBed",
+    "FLATBED": "FlatBed",
+    "ADF": "Automatic Document Feeder(left aligned)",
+}
+
+
 def scan_to_file(
     config: dict,
     batch_id: str,
@@ -138,6 +148,9 @@ def scan_to_file(
     Returns ``(temporary_path, final_path)`` when the scan succeeded, leaving
     publication to the caller. The temporary name is hidden so Paperless
     ignores it until the batch is complete.
+
+    On the ADF, ``scanimage`` is run in batch mode and the page files are
+    combined into one multi-page TIFF before returning.
     """
     ext = config["format"]
     outfile = os.path.join(
@@ -148,30 +161,114 @@ def scan_to_file(
         config["consume_dir"],
         f".scan_{batch_id}_{seq:02d}.{ext}.part",
     )
+    page_pattern = os.path.join(
+        config["consume_dir"],
+        f".scan_{batch_id}_{seq:02d}_page_%03d.{ext}",
+    )
     log_file = config.get("log_file")
 
-    log(f"Starting scan -> {outfile}", log_file)
+    source = str(config.get("source", "ADF"))
+    source = SOURCE_ALIASES.get(source.upper(), source)
+    use_adf_batch = "document feeder" in source.lower() and ext.lower() in (
+        "tif",
+        "tiff",
+    )
+
+    log(f"Starting scan -> {outfile} (source={source})", log_file)
 
     def cleanup_tmp() -> None:
         if os.path.exists(tmpfile):
             os.remove(tmpfile)
 
+    def cleanup_pages() -> None:
+        for path in glob.glob(page_pattern.replace("%03d", "*")):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def run_retry(cmd: list[str], has_pages: bool = False):
+        """Run scanimage, retrying the device-open race once or twice."""
+        last = None
+        for attempt in range(1, 4):
+            last = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=config["scan_timeout"],
+            )
+            if last.returncode == 0:
+                return last
+            if has_pages and glob.glob(page_pattern.replace("%03d", "*")):
+                return last
+            stderr = (last.stderr or "").lower()
+            if "invalid argument" not in stderr or attempt == 3:
+                return last
+            log(
+                f"Scan retry {attempt}/2 after: {last.stderr.strip()}",
+                log_file,
+            )
+            time.sleep(3)
+        return last
+
     try:
-        cmd = [
+        base_cmd = [
             "scanimage",
             f"--device-name={config['scanner_device']}",
             f"--resolution={config['resolution']}",
             f"--format={config['format']}",
-            f"--output-file={tmpfile}",
+            f"--source={source}",
         ]
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=config["scan_timeout"],
-        )
+        if use_adf_batch:
+            cleanup_pages()
+            cmd = base_cmd + [f"--batch={page_pattern}"]
+            result = run_retry(cmd, has_pages=True)
+            pages = sorted(glob.glob(page_pattern.replace("%03d", "*")))
+            if not pages:
+                log(
+                    f"Scan failed: exit={getattr(result, 'returncode', '?')} "
+                    f"stderr={(getattr(result, 'stderr', '') or '').strip()}",
+                    log_file,
+                )
+                cleanup_tmp()
+                return None
+            if result.returncode != 0:
+                log(
+                    f"Scan returned exit={result.returncode} after "
+                    f"{len(pages)} page(s); combining partial batch",
+                    log_file,
+                )
+            combine = subprocess.run(
+                ["tiffcp", "-c", "lzw", *pages, tmpfile],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if (
+                combine.returncode != 0
+                or not os.path.exists(tmpfile)
+                or os.path.getsize(tmpfile) == 0
+            ):
+                log(
+                    f"tiffcp failed: exit={combine.returncode} "
+                    f"stderr={combine.stderr.strip()}",
+                    log_file,
+                )
+                cleanup_tmp()
+                cleanup_pages()
+                return None
+            size = os.path.getsize(tmpfile)
+            log(
+                f"Scanned {len(pages)} page(s) into {tmpfile} ({size:,} bytes)",
+                log_file,
+            )
+            cleanup_pages()
+            return tmpfile, outfile
 
+        # Flatbed or non-TIFF output: one page.
+        cmd = base_cmd + [f"--output-file={tmpfile}"]
+        result = run_retry(cmd)
         if (
             result.returncode == 0
             and os.path.exists(tmpfile)
@@ -180,7 +277,8 @@ def scan_to_file(
             return tmpfile, outfile
 
         log(
-            f"Scan failed: exit={result.returncode} stderr={result.stderr.strip()}",
+            f"Scan failed: exit={getattr(result, 'returncode', '?')} "
+            f"stderr={(getattr(result, 'stderr', '') or '').strip()}",
             log_file,
         )
         cleanup_tmp()
@@ -189,10 +287,17 @@ def scan_to_file(
     except subprocess.TimeoutExpired:
         log(f"Scan timed out after {config['scan_timeout']}s", log_file)
         cleanup_tmp()
+        cleanup_pages()
+        return None
+    except FileNotFoundError as e:
+        log(f"Scan command missing: {e}", log_file)
+        cleanup_tmp()
+        cleanup_pages()
         return None
     except Exception as e:
         log(f"Scan error: {e}", log_file)
         cleanup_tmp()
+        cleanup_pages()
         return None
 
 
@@ -267,12 +372,86 @@ def run_daemon(config: dict) -> None:
     batch_id: str | None = None
     first_scan_at: float | None = None
     last_scan_at: float | None = None
+    seen_events: dict[tuple[str, str], float] = {}
 
     def publish_pending() -> None:
-        """Publish every held scan in one batch."""
+        """Publish the held scans, merged into one TIFF when configured."""
         nonlocal pending, batch_id, first_scan_at, last_scan_at
         if not pending:
             return
+
+        ext = str(config.get("format", "tiff"))
+        merge_batch = bool(config.get("merge_batch", False)) and ext.lower() in (
+            "tif",
+            "tiff",
+        )
+        if merge_batch:
+            merged_tmp = os.path.join(
+                config["consume_dir"],
+                f".scan_{batch_id}.{ext}.part",
+            )
+            merged_final = os.path.join(
+                config["consume_dir"],
+                f"scan_{batch_id}.{ext}",
+            )
+            published = False
+            try:
+                if len(pending) == 1:
+                    os.replace(pending[0]["tmp"], merged_tmp)
+                else:
+                    combine = subprocess.run(
+                        [
+                            "tiffcp",
+                            "-c",
+                            "lzw",
+                            *[item["tmp"] for item in pending],
+                            merged_tmp,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=300,
+                    )
+                    if (
+                        combine.returncode != 0
+                        or not os.path.exists(merged_tmp)
+                        or os.path.getsize(merged_tmp) == 0
+                    ):
+                        raise RuntimeError(
+                            f"tiffcp exit={combine.returncode} "
+                            f"{combine.stderr.strip()}",
+                        )
+                os.replace(merged_tmp, merged_final)
+                size = os.path.getsize(merged_final)
+                log(
+                    f"Batch {batch_id}: merged {len(pending)} scan(s) into "
+                    f"{merged_final} ({size:,} bytes)",
+                    log_file,
+                )
+                published = True
+            except Exception as e:
+                log(
+                    f"Batch {batch_id}: merge failed ({e}); publishing separately",
+                    log_file,
+                )
+                try:
+                    if os.path.exists(merged_tmp):
+                        os.remove(merged_tmp)
+                except OSError:
+                    pass
+
+            if published:
+                for item in pending:
+                    try:
+                        if os.path.exists(item["tmp"]):
+                            os.remove(item["tmp"])
+                    except OSError:
+                        pass
+                pending = []
+                batch_id = None
+                first_scan_at = None
+                last_scan_at = None
+                return
+
         for item in pending:
             try:
                 os.replace(item["tmp"], item["final"])
@@ -308,25 +487,28 @@ def run_daemon(config: dict) -> None:
         return False
 
     def cleanup_orphans() -> None:
-        pattern = os.path.join(config["consume_dir"], ".scan_*.part")
-        for path in glob.glob(pattern):
-            try:
-                os.remove(path)
-                log(f"Removed orphaned temporary scan {path}", log_file)
-            except OSError as e:
-                log(f"Could not remove orphaned scan {path}: {e}", log_file)
+        patterns = (".scan_*.part", ".scan_*_page_*")
+        for pattern in patterns:
+            for path in glob.glob(os.path.join(config["consume_dir"], pattern)):
+                try:
+                    os.remove(path)
+                    log(f"Removed orphaned temporary scan {path}", log_file)
+                except OSError as e:
+                    log(f"Could not remove orphaned scan {path}: {e}", log_file)
 
-    log("brother-scan-to-paperless daemon starting", log_file)
+    log(f"brother-scan-to-paperless {__version__} daemon starting", log_file)
     log(f"  Printer:    {config['printer_ip']}", log_file)
     log(f"  Host:       {config['host_ip']}", log_file)
     log(f"  Consume:    {config['consume_dir']}", log_file)
     log(f"  Device:     {config['scanner_device']}", log_file)
     log(f"  Resolution: {config['resolution']} dpi", log_file)
     log(f"  Format:     {config['format']}", log_file)
+    log(f"  Source:     {config.get('source', 'ADF')}", log_file)
     log(
         f"  Batch:      {config.get('batch_idle_seconds', 45)}s idle, "
         f"{config.get('batch_max_wait_seconds', 300)}s max, "
-        f"{config.get('batch_max_files', 10)} files",
+        f"{config.get('batch_max_files', 10)} files, "
+        f"merge={bool(config.get('merge_batch', False))}",
         log_file,
     )
 
@@ -389,6 +571,24 @@ def run_daemon(config: dict) -> None:
             data, addr = sock.recvfrom(1024)
             msg = data.decode("utf-8", errors="replace")
             log(f"Received from {addr}: {msg[:120]}", log_file)
+
+            regid_match = re.search(r"REGID=([^;\s]+)", msg)
+            seq_match = re.search(r"SEQ=([^;\s]+)", msg)
+            if regid_match and seq_match:
+                event_key = (regid_match.group(1), seq_match.group(1))
+                now = time.time()
+                dedupe = max(0, int(config.get("dedupe_seconds", 900)))
+                for key, seen_at in list(seen_events.items()):
+                    if now - seen_at > dedupe:
+                        del seen_events[key]
+                if event_key in seen_events:
+                    log(
+                        f"Ignoring duplicate scan event "
+                        f"REGID={event_key[0]} SEQ={event_key[1]}",
+                        log_file,
+                    )
+                    continue
+                seen_events[event_key] = now
 
             if "BUTTON=SCAN" in msg:
                 now = time.time()

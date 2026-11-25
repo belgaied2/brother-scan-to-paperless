@@ -3,7 +3,8 @@ name: Build and push image
 on:
   push:
     branches: [main]
-    paths: ['src/**', 'Dockerfile']
+    tags: ['v*']
+    paths: ['src/**', 'Dockerfile', '.github/workflows/build.yaml']
   workflow_dispatch:
 
 jobs:
@@ -24,7 +25,9 @@ jobs:
         with:
           images: ghcr.io/belgaied2/brother-scan-to-paperless
           tags: |
-            type=raw,value=main
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
             type=raw,value={{date 'YYYYMMDD'}}
       - uses: docker/build-push-action@v6
         with:
