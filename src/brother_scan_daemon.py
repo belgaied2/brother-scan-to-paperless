@@ -22,7 +22,7 @@ import sys
 import time
 from datetime import datetime
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 DEFAULT_CONFIG_PATHS = [
     "/etc/brother-scan-to-paperless/config.json",
@@ -163,7 +163,7 @@ def scan_to_file(
     )
     page_pattern = os.path.join(
         config["consume_dir"],
-        f".scan_{batch_id}_{seq:02d}_page_%03d.{ext}",
+        f".scan_{batch_id}_{seq:02d}_page_%03d.{ext}.part",
     )
     log_file = config.get("log_file")
 

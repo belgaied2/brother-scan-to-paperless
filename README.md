@@ -148,11 +148,12 @@ Config lives at `/etc/brother-scan-to-paperless/config.json`:
 | `log_file` | Log file path | `/var/log/brother-scan-to-paperless.log` |
 
 On the ADF, `scanimage` runs in batch mode and the page files are combined with
-`tiffcp` into one multi-page TIFF per scan job. With `merge_batch` enabled, all
-jobs in the batch are merged into a single `scan_<batch>.tiff`; with it off,
-each job is published as `scan_<batch>_<seq>.tiff` so fronts and backs can be
-interleaved later. Hidden `.part` files are never visible to Paperless.
-`--test` publishes immediately.
+`tiffcp` into one multi-page TIFF per scan job. Intermediate page files use a
+`.part` extension so Paperless never consumes them while they are being written.
+With `merge_batch` enabled, all jobs in the batch are merged into a single
+`scan_<batch>.tiff`; with it off, each job is published as
+`scan_<batch>_<seq>.tiff` so fronts and backs can be interleaved later. Hidden
+`.part` files are never visible to Paperless. `--test` publishes immediately.
 
 All settings can also be passed as CLI flags (run `brother-scan-to-paperless run --help`).
 
