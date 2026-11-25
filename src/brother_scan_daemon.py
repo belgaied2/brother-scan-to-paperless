@@ -15,14 +15,16 @@ import glob
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 DEFAULT_CONFIG_PATHS = [
     "/etc/brother-scan-to-paperless/config.json",
@@ -46,6 +48,8 @@ DEFAULT_CONFIG = {
     "batch_max_files": 10,
     "dedupe_seconds": 900,
     "merge_batch": False,
+    "interleave_batch": True,
+    "collate_reverse_second": True,
     "display_name": "Paperless",
     "log_file": "/var/log/brother-scan-to-paperless.log",
 }
@@ -136,6 +140,74 @@ SOURCE_ALIASES = {
     "FLATBED": "FlatBed",
     "ADF": "Automatic Document Feeder(left aligned)",
 }
+
+
+def tiffcp_merge(paths: list[str], destination: str, timeout: int = 300) -> None:
+    """Combine TIFFs into one multi-page TIFF, failing on an empty result."""
+    result = subprocess.run(
+        ["tiffcp", "-c", "lzw", *paths, destination],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if (
+        result.returncode != 0
+        or not os.path.exists(destination)
+        or os.path.getsize(destination) == 0
+    ):
+        raise RuntimeError(
+            f"tiffcp exit={result.returncode} {result.stderr.strip()}",
+        )
+
+
+def interleave_tiffs(
+    paths: list[str],
+    destination: str,
+    reverse_second: bool = True,
+) -> None:
+    """Interleave the pages of two TIFF jobs into one multi-page TIFF.
+
+    The first job is treated as the front stack and the second as the back
+    stack. When ``reverse_second`` is true the back stack is reversed, which
+    matches feeding the flipped stack through a simplex ADF.
+    """
+    if len(paths) != 2:
+        raise ValueError("interleave requires exactly two jobs")
+
+    workdir = tempfile.mkdtemp(prefix="brother-scan-")
+    try:
+        page_sets: list[list[str]] = []
+        for index, path in enumerate(paths):
+            prefix = os.path.join(workdir, f"job{index}_")
+            result = subprocess.run(
+                ["tiffsplit", str(path), prefix],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"tiffsplit exit={result.returncode} "
+                    f"{result.stderr.strip()}",
+                )
+            pages = sorted(glob.glob(prefix + "*"))
+            if not pages:
+                raise RuntimeError(f"tiffsplit produced no pages for {path}")
+            page_sets.append(pages)
+
+        front, back = page_sets
+        ordered: list[str] = []
+        for index in range(max(len(front), len(back))):
+            if index < len(front):
+                ordered.append(front[index])
+            back_index = len(back) - 1 - index if reverse_second else index
+            if 0 <= back_index < len(back):
+                ordered.append(back[back_index])
+
+        tiffcp_merge(ordered, destination)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
 
 
 def scan_to_file(
@@ -239,22 +311,10 @@ def scan_to_file(
                     f"{len(pages)} page(s); combining partial batch",
                     log_file,
                 )
-            combine = subprocess.run(
-                ["tiffcp", "-c", "lzw", *pages, tmpfile],
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            if (
-                combine.returncode != 0
-                or not os.path.exists(tmpfile)
-                or os.path.getsize(tmpfile) == 0
-            ):
-                log(
-                    f"tiffcp failed: exit={combine.returncode} "
-                    f"stderr={combine.stderr.strip()}",
-                    log_file,
-                )
+            try:
+                tiffcp_merge(pages, tmpfile, timeout=120)
+            except Exception as e:
+                log(f"tiffcp failed: {e}", log_file)
                 cleanup_tmp()
                 cleanup_pages()
                 return None
@@ -398,28 +458,32 @@ def run_daemon(config: dict) -> None:
             try:
                 if len(pending) == 1:
                     os.replace(pending[0]["tmp"], merged_tmp)
-                else:
-                    combine = subprocess.run(
-                        [
-                            "tiffcp",
-                            "-c",
-                            "lzw",
-                            *[item["tmp"] for item in pending],
+                elif len(pending) == 2 and bool(
+                    config.get("interleave_batch", True),
+                ):
+                    try:
+                        interleave_tiffs(
+                            [item["tmp"] for item in pending],
                             merged_tmp,
-                        ],
-                        capture_output=True,
-                        text=True,
-                        timeout=300,
-                    )
-                    if (
-                        combine.returncode != 0
-                        or not os.path.exists(merged_tmp)
-                        or os.path.getsize(merged_tmp) == 0
-                    ):
-                        raise RuntimeError(
-                            f"tiffcp exit={combine.returncode} "
-                            f"{combine.stderr.strip()}",
+                            reverse_second=bool(
+                                config.get("collate_reverse_second", True),
+                            ),
                         )
+                    except Exception as e:
+                        log(
+                            f"Batch {batch_id}: interleave failed ({e}); "
+                            f"concatenating",
+                            log_file,
+                        )
+                        tiffcp_merge(
+                            [item["tmp"] for item in pending],
+                            merged_tmp,
+                        )
+                else:
+                    tiffcp_merge(
+                        [item["tmp"] for item in pending],
+                        merged_tmp,
+                    )
                 os.replace(merged_tmp, merged_final)
                 size = os.path.getsize(merged_final)
                 log(
