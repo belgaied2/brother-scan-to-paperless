@@ -11,6 +11,7 @@ Requires: brscan4 driver, sane-utils, snmp
 """
 
 import argparse
+import glob
 import json
 import os
 import signal
@@ -39,6 +40,9 @@ DEFAULT_CONFIG = {
     "format": "tiff",
     "register_interval": 300,
     "scan_timeout": 120,
+    "batch_idle_seconds": 45,
+    "batch_max_wait_seconds": 300,
+    "batch_max_files": 10,
     "display_name": "Paperless",
     "log_file": "/var/log/brother-scan-to-paperless.log",
 }
@@ -124,18 +128,25 @@ def register_profiles(
         return False
 
 
-def do_scan(config: dict) -> bool:
-    """Run scanimage and save to the consume folder."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+def scan_to_file(
+    config: dict,
+    batch_id: str,
+    seq: int,
+) -> tuple[str, str] | None:
+    """Run scanimage into a hidden temp file.
+
+    Returns ``(temporary_path, final_path)`` when the scan succeeded, leaving
+    publication to the caller. The temporary name is hidden so Paperless
+    ignores it until the batch is complete.
+    """
     ext = config["format"]
-    outfile = os.path.join(config["consume_dir"], f"scan_{timestamp}.{ext}")
-    # Write to a hidden temporary file and rename it into place only once
-    # scanimage has finished. Paperless ignores dotfiles, so it can never pick
-    # up a partially written image when the consume directory is on a network
-    # filesystem where its size stability check may see stale attributes.
+    outfile = os.path.join(
+        config["consume_dir"],
+        f"scan_{batch_id}_{seq:02d}.{ext}",
+    )
     tmpfile = os.path.join(
         config["consume_dir"],
-        f".scan_{timestamp}.{ext}.part",
+        f".scan_{batch_id}_{seq:02d}.{ext}.part",
     )
     log_file = config.get("log_file")
 
@@ -166,28 +177,39 @@ def do_scan(config: dict) -> bool:
             and os.path.exists(tmpfile)
             and os.path.getsize(tmpfile) > 0
         ):
-            # Atomic within the consume filesystem: Paperless either sees the
-            # temporary file (ignored) or the complete final image.
-            os.replace(tmpfile, outfile)
-            size = os.path.getsize(outfile)
-            log(f"Scan complete: {outfile} ({size:,} bytes)", log_file)
-            return True
-        else:
-            log(
-                f"Scan failed: exit={result.returncode} stderr={result.stderr.strip()}",
-                log_file,
-            )
-            cleanup_tmp()
-            return False
+            return tmpfile, outfile
+
+        log(
+            f"Scan failed: exit={result.returncode} stderr={result.stderr.strip()}",
+            log_file,
+        )
+        cleanup_tmp()
+        return None
 
     except subprocess.TimeoutExpired:
         log(f"Scan timed out after {config['scan_timeout']}s", log_file)
         cleanup_tmp()
-        return False
+        return None
     except Exception as e:
         log(f"Scan error: {e}", log_file)
         cleanup_tmp()
+        return None
+
+
+def do_scan(config: dict) -> bool:
+    """Run one scan and publish it immediately (used by --test)."""
+    batch_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    result = scan_to_file(config, batch_id, 1)
+    if result is None:
         return False
+
+    tmpfile, outfile = result
+    # Atomic within the consume filesystem: Paperless either sees the
+    # temporary file (ignored) or the complete final image.
+    os.replace(tmpfile, outfile)
+    size = os.path.getsize(outfile)
+    log(f"Scan complete: {outfile} ({size:,} bytes)", config.get("log_file"))
+    return True
 
 
 def load_config(config_path: str | None = None) -> dict:
@@ -241,6 +263,59 @@ def run_daemon(config: dict) -> None:
     """Main daemon loop."""
     log_file = config.get("log_file")
 
+    pending: list[dict] = []
+    batch_id: str | None = None
+    first_scan_at: float | None = None
+    last_scan_at: float | None = None
+
+    def publish_pending() -> None:
+        """Publish every held scan in one batch."""
+        nonlocal pending, batch_id, first_scan_at, last_scan_at
+        if not pending:
+            return
+        for item in pending:
+            try:
+                os.replace(item["tmp"], item["final"])
+                size = os.path.getsize(item["final"])
+                log(
+                    f"Batch {item['batch']}: published {item['final']} ({size:,} bytes)",
+                    log_file,
+                )
+            except Exception as e:
+                log(
+                    f"Batch {item['batch']}: failed to publish {item['final']}: {e}",
+                    log_file,
+                )
+                try:
+                    if os.path.exists(item["tmp"]):
+                        os.remove(item["tmp"])
+                except OSError:
+                    pass
+        pending = []
+        batch_id = None
+        first_scan_at = None
+        last_scan_at = None
+
+    def batch_expired(now: float) -> bool:
+        if not pending:
+            return False
+        idle = max(0, int(config.get("batch_idle_seconds", 45)))
+        max_wait = max(0, int(config.get("batch_max_wait_seconds", 300)))
+        if idle and last_scan_at is not None and now - last_scan_at >= idle:
+            return True
+        if max_wait and first_scan_at is not None and now - first_scan_at >= max_wait:
+            return True
+        return False
+
+    def cleanup_orphans() -> None:
+        pattern = os.path.join(config["consume_dir"], ".scan_*.part")
+        for path in glob.glob(pattern):
+            try:
+                os.remove(path)
+                log(f"Removed orphaned temporary scan {path}", log_file)
+            except OSError as e:
+                log(f"Could not remove orphaned scan {path}: {e}", log_file)
+
     log("brother-scan-to-paperless daemon starting", log_file)
     log(f"  Printer:    {config['printer_ip']}", log_file)
     log(f"  Host:       {config['host_ip']}", log_file)
@@ -248,6 +323,14 @@ def run_daemon(config: dict) -> None:
     log(f"  Device:     {config['scanner_device']}", log_file)
     log(f"  Resolution: {config['resolution']} dpi", log_file)
     log(f"  Format:     {config['format']}", log_file)
+    log(
+        f"  Batch:      {config.get('batch_idle_seconds', 45)}s idle, "
+        f"{config.get('batch_max_wait_seconds', 300)}s max, "
+        f"{config.get('batch_max_files', 10)} files",
+        log_file,
+    )
+
+    cleanup_orphans()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -256,6 +339,7 @@ def run_daemon(config: dict) -> None:
 
     def shutdown(signum, frame):
         log("Shutting down", log_file)
+        publish_pending()
         sock.close()
         sys.exit(0)
 
@@ -274,6 +358,9 @@ def run_daemon(config: dict) -> None:
     log(f"Listening on UDP port {config['listen_port']}", log_file)
 
     while True:
+        if batch_expired(time.time()):
+            publish_pending()
+
         if time.time() - last_register > config["register_interval"]:
             register_profiles(
                 config["printer_ip"],
@@ -284,15 +371,60 @@ def run_daemon(config: dict) -> None:
             )
             last_register = time.time()
 
+        timeout = 30.0
+        if pending:
+            now = time.time()
+            idle = max(0, int(config.get("batch_idle_seconds", 45)))
+            max_wait = max(0, int(config.get("batch_max_wait_seconds", 300)))
+            deadlines = []
+            if idle and last_scan_at is not None:
+                deadlines.append(last_scan_at + idle - now)
+            if max_wait and first_scan_at is not None:
+                deadlines.append(first_scan_at + max_wait - now)
+            if deadlines:
+                timeout = max(0.5, min(30.0, min(deadlines)))
+        sock.settimeout(timeout)
+
         try:
             data, addr = sock.recvfrom(1024)
             msg = data.decode("utf-8", errors="replace")
             log(f"Received from {addr}: {msg[:120]}", log_file)
 
             if "BUTTON=SCAN" in msg:
-                do_scan(config)
+                now = time.time()
+                if batch_id is None:
+                    batch_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    first_scan_at = now
+
+                seq = len(pending) + 1
+                result = scan_to_file(config, batch_id, seq)
+                if result is not None:
+                    tmpfile, outfile = result
+                    pending.append(
+                        {"batch": batch_id, "tmp": tmpfile, "final": outfile},
+                    )
+                    last_scan_at = time.time()
+                    log(
+                        f"Batch {batch_id}: {len(pending)} scan(s) held; "
+                        f"publishing after "
+                        f"{config.get('batch_idle_seconds', 45)}s idle",
+                        log_file,
+                    )
+                    max_files = max(0, int(config.get("batch_max_files", 10)))
+                    if max_files and len(pending) >= max_files:
+                        log(
+                            f"Batch {batch_id}: reached {max_files} files",
+                            log_file,
+                        )
+                        publish_pending()
+                elif not pending:
+                    batch_id = None
+                    first_scan_at = None
+                    last_scan_at = None
 
         except socket.timeout:
+            if batch_expired(time.time()):
+                publish_pending()
             continue
         except Exception as e:
             log(f"Error: {e}", log_file)

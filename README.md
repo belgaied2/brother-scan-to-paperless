@@ -139,8 +139,16 @@ Config lives at `/etc/brother-scan-to-paperless/config.json`:
 | `format` | Output format (`tiff`, `png`, `pnm`) | `tiff` |
 | `register_interval` | Seconds between SNMP re-registrations | `300` |
 | `scan_timeout` | Max seconds for a single scan | `120` |
+| `batch_idle_seconds` | Seconds without a new scan before the batch is published | `45` |
+| `batch_max_wait_seconds` | Hard cap on how long a batch is held | `300` |
+| `batch_max_files` | Publish once the batch has this many scans (`0` = no limit) | `10` |
 | `display_name` | Name shown on printer LCD | `Paperless` |
 | `log_file` | Log file path | `/var/log/brother-scan-to-paperless.log` |
+
+Scans are written as hidden `.scan_<batch>_<seq>.<ext>.part` files and published
+together as `scan_<batch>_<seq>.<ext>` when the batch window closes, so Paperless
+never sees a partial file and can group a multi-scan batch. `--test` publishes
+immediately.
 
 All settings can also be passed as CLI flags (run `brother-scan-to-paperless run --help`).
 
