@@ -134,6 +134,7 @@ Config lives at `/etc/brother-scan-to-paperless/config.json`:
 | `consume_dir` | Paperless-ngx consume folder path | (required) |
 | `scanner_device` | SANE device name | `brother4:net1;dev0` |
 | `resolution` | Scan resolution in DPI | `300` |
+| `mode` | Scan color mode (`True Gray`, `Black & White`, `Gray[Error Diffusion]`, `24bit Color[Fast]`) | `True Gray` |
 | `source` | Scan source: `FB` = flatbed, `ADF` = feeder. ADF uses batch mode and combines pages. | `FB` |
 | `size` | Paper size | `A4` |
 | `format` | Output format (`tiff`, `png`, `pnm`) | `tiff` |
@@ -157,6 +158,12 @@ job with the reversed second job and publishes one ordered `scan_<batch>.tiff`.
 Set `interleave_batch` to false to concatenate instead. With `merge_batch` off,
 each job is published as `scan_<batch>_<seq>.tiff` for the triage `to-collate`
 step. `--test` publishes immediately.
+
+Only the `FILE` profile is registered, so the printer shows one **Paperless**
+entry under Scan to File. Profiles left by older registrations may remain and
+must be removed on the printer or its web UI. The printer sends every button
+event twice by design; no acknowledgement is expected, and the duplicate is
+ignored silently.
 
 All settings can also be passed as CLI flags (run `brother-scan-to-paperless run --help`).
 

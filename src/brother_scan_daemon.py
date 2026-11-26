@@ -24,7 +24,7 @@ import tempfile
 import time
 from datetime import datetime
 
-__version__ = "0.0.3"
+__version__ = "0.0.4"
 
 DEFAULT_CONFIG_PATHS = [
     "/etc/brother-scan-to-paperless/config.json",
@@ -38,6 +38,7 @@ DEFAULT_CONFIG = {
     "consume_dir": "",
     "scanner_device": "brother4:net1;dev0",
     "resolution": 300,
+    "mode": "True Gray",
     "source": "FB",
     "size": "A4",
     "format": "tiff",
@@ -107,9 +108,6 @@ def register_profiles(
     community = "internal"
 
     functions = [
-        ("IMAGE", 1),
-        ("EMAIL", 2),
-        ("OCR", 3),
         ("FILE", 5),
     ]
 
@@ -125,7 +123,7 @@ def register_profiles(
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
-            log("Registered scan profiles on printer", log_file)
+            log("Registered scan profile on printer", log_file)
             return True
         else:
             log(f"SNMP registration failed: {result.stderr.strip()}", log_file)
@@ -288,6 +286,7 @@ def scan_to_file(
             "scanimage",
             f"--device-name={config['scanner_device']}",
             f"--resolution={config['resolution']}",
+            f"--mode={config.get('mode', 'True Gray')}",
             f"--format={config['format']}",
             f"--source={source}",
         ]
@@ -566,6 +565,7 @@ def run_daemon(config: dict) -> None:
     log(f"  Consume:    {config['consume_dir']}", log_file)
     log(f"  Device:     {config['scanner_device']}", log_file)
     log(f"  Resolution: {config['resolution']} dpi", log_file)
+    log(f"  Mode:       {config.get('mode', 'True Gray')}", log_file)
     log(f"  Format:     {config['format']}", log_file)
     log(f"  Source:     {config.get('source', 'ADF')}", log_file)
     log(
@@ -646,11 +646,8 @@ def run_daemon(config: dict) -> None:
                     if now - seen_at > dedupe:
                         del seen_events[key]
                 if event_key in seen_events:
-                    log(
-                        f"Ignoring duplicate scan event "
-                        f"REGID={event_key[0]} SEQ={event_key[1]}",
-                        log_file,
-                    )
+                    # The printer sends every event twice by design; no reply
+                    # is expected. Ignore silently.
                     continue
                 seen_events[event_key] = now
 
